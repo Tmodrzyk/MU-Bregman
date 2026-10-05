@@ -1,17 +1,61 @@
-from collections.abc import Callable
+"""Poisson reconstruction methods.
+
+MU, mirror descent, and the L2/TV methods return ``(reconstruction, metrics)``.
+The metrics dictionary contains objective, NRMSE (percent), and relative
+progress at initialization and after every update. NRMSE is NaN without
+``x_ref``. With ``keep_inter=True``, it also contains CPU ``iterates``.
+"""
 
 import deepinv
 import torch
 from tqdm import tqdm
 from .prox import (
-    TVProxMethod,
-    right_prox_L1_negative_entropy,
-    right_prox_L2_negative_entropy,
-    right_prox_TV_negative_entropy,
-    torch_divergence,
-    torch_gradient,
-    torch_module,
+    rprox_negentropy_l1,
+    rprox_negentropy_l2,
+    rprox_negentropy_TV,
 )
+
+
+def poisson_objective(prediction: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Poisson negative log-likelihood with double-precision reduction."""
+    prediction_double = prediction.to(torch.float64)
+    return (prediction_double - y.to(torch.float64) * prediction_double.log()).sum()
+
+
+@torch.no_grad()
+def record_metrics(
+    metrics, recon, previous, prediction, y, x_ref=None, l2_weight=0.0, tv_weight=0.0
+):
+    """Append objective, NRMSE (%), and relative progress to ``metrics``.
+
+    ``previous=None`` denotes the initial iterate. Without ``x_ref``, NRMSE
+    is NaN. Return a detached copy to use as ``previous`` at the next call.
+    """
+    objective = poisson_objective(prediction, y)
+    if l2_weight:
+        objective += (l2_weight / 2) * recon.to(torch.float64).square().sum()
+    if tv_weight:
+        objective += tv_weight * deepinv.optim.TVPrior().fn(recon).sum()
+    metrics["objective"].append(objective.item())
+    metrics["nrmse"].append(
+        100 * deepinv.metric.NMSE(reduction="mean")(recon, x_ref).sqrt().item()
+        if x_ref is not None
+        else float("nan")
+    )
+    progress = (
+        float("nan")
+        if previous is None
+        else max(
+            (
+                torch.linalg.norm(recon - previous)
+                / torch.linalg.norm(previous).clamp_min(1e-16)
+            ).item(),
+            1e-16,
+        )
+    )
+    metrics["relative_progress"].append(progress)
+    return recon.detach().clone()
+
 
 ##########################
 # Unregularized algorithms
@@ -19,7 +63,7 @@ from .prox import (
 
 
 @torch.no_grad()
-def mlem(
+def mu(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -28,8 +72,8 @@ def mlem(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
     """
     MLEM (Maximum Likelihood Expectation Maximization) reconstruction algorithm.
 
@@ -41,12 +85,13 @@ def mlem(
     :param deepinv.physics.LinearPhysics physics: The linear physics operator describing the forward model.
     :param int max_steps: Maximum number of iterations to perform.
     :param bool verbose: Whether to display a progress bar during execution. Default: True.
-    :param bool keep_inter: Whether to keep and return intermediate reconstruction results. Default: False.
+    :param bool keep_inter: Include CPU intermediate images in metrics["iterates"].
     :param float filter_epsilon: Small epsilon value for numerical stability to avoid division by zero. Default: 1e-20.
 
-    :return: If keep_inter is False, returns the final reconstructed image. If keep_inter is True, returns a tuple containing the final reconstruction and a list of intermediate results.
-    :rtype: torch.Tensor or tuple(torch.Tensor, list[torch.Tensor])
+    :return: The reconstruction and a dictionary of metric histories.
     """
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -60,8 +105,7 @@ def mlem(
 
     for step in tqdm(range(max_steps), desc="MU", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(metrics, recon, previous, prediction, y, x_ref)
 
         mu_update = (recon / s) * physics.A_adjoint(y / prediction)
         recon = (1 - stepsize) * recon + stepsize * mu_update
@@ -69,15 +113,15 @@ def mlem(
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 @torch.no_grad()
-def nolips(
+def mirror_descent(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -86,22 +130,42 @@ def nolips(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+    *,
+    armijo_constant: float = 1e-4,
+    backtracking_factor: float = 0.5,
+    max_backtracks: int = 50,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
     """
-    NoLips reconstruction algorithm.
+    Mirror descent reconstruction with Burg's entropy.
 
-    This function implements the NoLips algorithm for Poisson inverse problems.
+    Each iteration starts from ``stepsize`` and shrinks it until the Burg
+    update is positive and the Poisson objective satisfies Armijo decrease:
+    f(trial) <= f(recon) + armijo_constant * <grad f(recon), trial - recon>.
+    The objective includes any additive background from the physics operator.
 
     :param torch.Tensor y: The observed/measured image.
     :param torch.Tensor x_init: The initial estimate for reconstruction.
-    :param float stepsize: Step size for the iterative update, typically in range [0, 1].
+    :param float stepsize: Initial trial step size for each backtracking search; must be positive.
     :param deepinv.physics.LinearPhysics physics: The linear physics operator describing the forward model.
     :param int max_steps: Maximum number of iterations to perform.
     :param bool verbose: Whether to display a progress bar during execution. Default: True.
-    :param bool keep_inter: Whether to keep and return intermediate reconstruction results. Default: False.
+    :param bool keep_inter: Include CPU intermediate images in metrics["iterates"].
     :param float filter_epsilon: Small epsilon value for numerical stability to avoid division by zero. Default: 1e-20.
+    :param float armijo_constant: Sufficient-decrease coefficient in (0, 1).
+    :param float backtracking_factor: Step reduction factor in (0, 1).
+    :param int max_backtracks: Maximum number of trial steps per iteration.
+    :raises RuntimeError: If no admissible decreasing trial step is found.
     """
+    if not 0 < stepsize < float("inf"):
+        raise ValueError("stepsize must be finite and positive.")
+    if not 0 < armijo_constant < 1 or not 0 < backtracking_factor < 1:
+        raise ValueError("Armijo constant and backtracking factor must lie in (0, 1).")
+    if max_backtracks < 1:
+        raise ValueError("max_backtracks must be positive.")
+
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -113,22 +177,42 @@ def nolips(
     else:
         b = torch.zeros_like(y)
 
-    for step in tqdm(range(max_steps), desc="NoLips", disable=not verbose):
+    for step in tqdm(range(max_steps), desc="Mirror descent", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(metrics, recon, previous, prediction, y, x_ref)
 
         grad = s - physics.A_adjoint(y / prediction)
-        recon = recon / (1 + stepsize * recon * grad)
+        current_objective = poisson_objective(prediction, y)
+        trial_stepsize = stepsize
+        for _ in range(max_backtracks):
+            denominator = 1 + trial_stepsize * recon * grad
+            if torch.isfinite(denominator).all() and (denominator > 0).all():
+                trial = recon / denominator
+                if torch.isfinite(trial).all() and (trial > 0).all():
+                    trial_prediction = physics.A(trial).clamp(min=filter_epsilon) + b
+                    trial_objective = poisson_objective(trial_prediction, y)
+                    directional_change = (
+                        grad.to(torch.float64) * (trial - recon).to(torch.float64)
+                    ).sum()
+                    if torch.isfinite(trial_objective) and trial_objective <= (
+                        current_objective + armijo_constant * directional_change
+                    ):
+                        recon = trial
+                        break
+            trial_stepsize *= backtracking_factor
+        else:
+            raise RuntimeError(
+                f"Mirror descent backtracking failed at iteration {step}."
+            )
 
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 ##########################
@@ -137,7 +221,7 @@ def nolips(
 
 
 @torch.no_grad()
-def mlem_L1(
+def rbpg_l1(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -159,12 +243,12 @@ def mlem_L1(
     else:
         b = torch.zeros_like(y)
 
-    for step in tqdm(range(max_steps), desc="MU + L1", disable=not verbose):
-        mlem = (recon / s) * physics.A_adjoint(
+    for step in tqdm(range(max_steps), desc="R-BPG + L1", disable=not verbose):
+        mu_update = (recon / s) * physics.A_adjoint(
             y / (physics.A(recon).clamp(min=filter_epsilon) + b)
         )
-        recon = (1 - stepsize) * recon + stepsize * mlem
-        recon = right_prox_L1_negative_entropy(
+        recon = (1 - stepsize) * recon + stepsize * mu_update
+        recon = rprox_negentropy_l1(
             x=recon,
             weight=stepsize * reg_weight,
             sensitivity=s,
@@ -178,7 +262,7 @@ def mlem_L1(
 
 
 @torch.no_grad()
-def mlem_L1_osl(
+def osl_l1(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -223,7 +307,7 @@ def mlem_L1_osl(
 
 
 @torch.no_grad()
-def mlem_L2(
+def rbpg_l2(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -233,8 +317,10 @@ def mlem_L2(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -245,14 +331,15 @@ def mlem_L2(
         b = physics.background.clamp(min=filter_epsilon)
     else:
         b = torch.zeros_like(y)
-    for step in tqdm(range(max_steps), desc="MU + L2", disable=not verbose):
+    for step in tqdm(range(max_steps), desc="R-BPG + L2", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(
+            metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight
+        )
 
-        mlem = (recon / s) * physics.A_adjoint(y / prediction)
-        recon = (1 - stepsize) * recon + stepsize * mlem
-        recon = right_prox_L2_negative_entropy(
+        mu_update = (recon / s) * physics.A_adjoint(y / prediction)
+        recon = (1 - stepsize) * recon + stepsize * mu_update
+        recon = rprox_negentropy_l2(
             x=recon,
             weight=stepsize * reg_weight,
             sensitivity=s,
@@ -262,15 +349,15 @@ def mlem_L2(
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 @torch.no_grad()
-def mlem_L2_osl(
+def osl_l2(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -280,8 +367,8 @@ def mlem_L2_osl(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
     r"""MLEM with L2 regularization using one-step-late (OSL) approximation.
 
     Uses the standard OSL denominator for $R(x)=\tfrac12\|x\|_2^2$:
@@ -289,6 +376,8 @@ def mlem_L2_osl(
 
     With `stepsize=1`, this reduces to the classical multiplicative OSL update.
     """
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone().clamp(min=filter_epsilon)
@@ -301,8 +390,9 @@ def mlem_L2_osl(
 
     for step in tqdm(range(max_steps), desc="OSL + L2", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(
+            metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight
+        )
 
         backproj = physics.A_adjoint(y / prediction)
         denom = (s + reg_weight * recon).clamp(min=filter_epsilon)
@@ -314,15 +404,15 @@ def mlem_L2_osl(
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 @torch.no_grad()
-def mlem_tv(
+def rbpg_tv(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -330,19 +420,15 @@ def mlem_tv(
     reg_weight: float,
     max_steps: int,
     niter_tv: int = 50,
-    fista_tv: bool = False,
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-    tv_prox: TVProxMethod = "dual",
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-    """MLEM with a right Bregman TV proximal step.
+    x_ref: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
+    """MLEM with a right Bregman TV proximal step computed with PDHG."""
 
-    Set ``tv_prox="dual"`` for the specialized dual-TV solver or
-    ``tv_prox="pdhg"`` for standard primal-dual hybrid gradient.
-    """
-
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -354,35 +440,34 @@ def mlem_tv(
     else:
         b = torch.zeros_like(y)
 
-    for step in tqdm(range(max_steps), desc="MU + TV", disable=not verbose):
+    for step in tqdm(range(max_steps), desc="R-BPG + TV", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(
+            metrics, recon, previous, prediction, y, x_ref, tv_weight=reg_weight
+        )
 
         mu_update = (recon / s) * physics.A_adjoint(y / prediction)
         recon = (1 - stepsize) * recon + stepsize * mu_update
-        recon = right_prox_TV_negative_entropy(
+        recon = rprox_negentropy_TV(
             x=recon,
             weight=stepsize * reg_weight,
             sensitivity=s,
             filter_epsilon=filter_epsilon,
             n_iter=niter_tv,
-            fista_tv=fista_tv,
-            method=tv_prox,
         )
 
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref, tv_weight=reg_weight)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 @torch.no_grad()
-def mlem_tv_osl(
+def osl_tv(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -392,8 +477,8 @@ def mlem_tv_osl(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
     r"""
     MLEM with TV regularization using one-step-late (OSL) approximation.
 
@@ -405,13 +490,9 @@ def mlem_tv_osl(
     denominator, yielding: $s - \lambda\,\mathrm{div}(\nabla x / \|\nabla x\|)$.
     """
 
-    def tv_curvature(x: torch.Tensor, eps: float) -> torch.Tensor:
-        """Compute div(grad(x) / ||grad(x)||) over spatial dimensions."""
-        g = torch_gradient(x)
-        g_norm = torch_module(g).clamp(min=eps)
-        g_unit = g / g_norm.unsqueeze(0)
-        return torch_divergence(g_unit)
-
+    tv_prior = deepinv.optim.TVPrior()
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -425,13 +506,14 @@ def mlem_tv_osl(
 
     for step in tqdm(range(max_steps), desc="OSL + TV", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(
+            metrics, recon, previous, prediction, y, x_ref, tv_weight=reg_weight
+        )
 
-        tv_div = tv_curvature(recon, eps=1e-8)
+        tv_subgradient = tv_prior.grad(recon)
 
         backproj = physics.A_adjoint(y / prediction)
-        denom = (s - reg_weight * tv_div).clamp(min=filter_epsilon)
+        denom = (s + reg_weight * tv_subgradient).clamp(min=filter_epsilon)
         update = recon * backproj / denom
 
         # Optional relaxation (stepsize=1 recovers the classical multiplicative update)
@@ -441,51 +523,15 @@ def mlem_tv_osl(
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
-
-
-def nolips_L1(
-    y: torch.Tensor,
-    x_init: torch.Tensor,
-    stepsize: float,
-    physics: deepinv.physics.LinearPhysics,
-    reg_weight: float,
-    max_steps: int,
-    verbose: bool = True,
-    keep_inter: bool = False,
-    filter_epsilon: float = 1e-20,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-    xs = [x_init.cpu().clone()] if keep_inter else None
-
-    recon = x_init.clone()
-    recon = recon.clamp(min=filter_epsilon)
-    s = physics.A_adjoint(torch.ones_like(y)).clamp_min(filter_epsilon)
-
-    if hasattr(physics, "background"):
-        b = physics.background.clamp(min=filter_epsilon)
-    else:
-        b = torch.zeros_like(y)
-
-    for step in tqdm(range(max_steps), desc="NoLips + L1", disable=not verbose):
-        grad = s - physics.A_adjoint(
-            y / (physics.A(recon).clamp(min=filter_epsilon) + b)
-        )
-        recon = recon / (1 + stepsize * (reg_weight * recon + recon * grad)).clamp(
-            min=filter_epsilon
-        )
-
-        if keep_inter:
-            xs.append(recon.cpu().clone())
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref, tv_weight=reg_weight)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics
 
 
 @torch.no_grad()
-def nolips_L2(
+def bpg_l2(
     y: torch.Tensor,
     x_init: torch.Tensor,
     stepsize: float,
@@ -495,8 +541,36 @@ def nolips_L2(
     verbose: bool = True,
     keep_inter: bool = False,
     filter_epsilon: float = 1e-20,
-    iterate_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    x_ref: torch.Tensor | None = None,
+    *,
+    armijo_constant: float = 1e-4,
+    backtracking_factor: float = 0.5,
+    max_backtracks: int = 50,
+) -> tuple[torch.Tensor, dict[str, list[float] | list[torch.Tensor]]]:
+    """Burg Bregman proximal gradient with L2 composite Armijo backtracking.
+
+    The objective is F(x) = f(x) + g(x), where f is the Poisson negative
+    log-likelihood including any additive background and
+    g(x) = reg_weight / 2 * ||x||^2. Each iteration starts from ``stepsize``
+    and recomputes the exact Bregman proximal candidate after every shrink.
+    A finite, strictly positive candidate is accepted when
+
+        F(trial) <= F(recon) + armijo_constant * (
+            <grad f(recon), trial - recon> + g(trial) - g(recon)
+        ).
+
+    ``stepsize`` must be finite and positive, ``reg_weight`` finite and
+    nonnegative, and both line-search factors must lie in (0, 1).
+    ``max_backtracks`` bounds the number of trial steps per iteration.
+    With zero regularization this reduces to Burg mirror descent.
+    Raises RuntimeError if no admissible decreasing trial step is found.
+    """
+
+    def regularizer(x):
+        return (reg_weight / 2) * x.to(torch.float64).square().sum()
+
+    metrics = {"objective": [], "nrmse": [], "relative_progress": []}
+    previous = None
     xs = [x_init.cpu().clone()] if keep_inter else None
 
     recon = x_init.clone()
@@ -508,25 +582,60 @@ def nolips_L2(
     else:
         b = torch.zeros_like(y)
 
-    for step in tqdm(range(max_steps), desc="NoLips + L2", disable=not verbose):
+    for step in tqdm(range(max_steps), desc="BPG + L2", disable=not verbose):
         prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        if iterate_callback is not None:
-            iterate_callback(step, recon, prediction)
+        previous = record_metrics(
+            metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight
+        )
 
         grad = s - physics.A_adjoint(y / prediction)
-        recon = (
-            torch.sqrt(
-                (1 + stepsize * recon * grad) ** 2
-                + 4 * stepsize * reg_weight * recon**2
-            )
-            - (1 + stepsize * recon * grad)
-        ) / (2 * stepsize * reg_weight * recon).clamp(min=filter_epsilon)
+        current_regularizer = regularizer(recon)
+        current_objective = poisson_objective(prediction, y) + current_regularizer
+        trial_stepsize = stepsize
+        for _ in range(max_backtracks):
+            denominator = 1 + trial_stepsize * recon * grad
+            if not torch.isfinite(denominator).all():
+                trial_stepsize *= backtracking_factor
+                continue
+
+            if reg_weight == 0:
+                if not (denominator > 0).all():
+                    trial_stepsize *= backtracking_factor
+                    continue
+                trial = recon / denominator
+            else:
+                root = torch.hypot(
+                    denominator, 2 * (trial_stepsize * reg_weight) ** 0.5 * recon
+                )
+                trial = torch.where(
+                    denominator >= 0,
+                    2 * recon / (denominator + root),
+                    (root - denominator) / (2 * trial_stepsize * reg_weight * recon),
+                )
+
+            if torch.isfinite(trial).all() and (trial > 0).all():
+                trial_prediction = physics.A(trial).clamp(min=filter_epsilon) + b
+                trial_objective = poisson_objective(trial_prediction, y) + regularizer(trial)
+                displacement = trial.to(torch.float64) - recon.to(torch.float64)
+                directional_change = (grad.to(torch.float64) * displacement).sum()
+                regularizer_change = (reg_weight / 2) * (
+                    displacement * (trial.to(torch.float64) + recon.to(torch.float64))
+                ).sum()
+                model_change = directional_change + regularizer_change
+                if torch.isfinite(trial_objective) and trial_objective <= (
+                    current_objective + armijo_constant * model_change
+                ):
+                    recon = trial
+                    break
+            trial_stepsize *= backtracking_factor
+        else:
+            raise RuntimeError(f"BPG + L2 backtracking failed at iteration {step}.")
 
         if keep_inter:
             xs.append(recon.cpu().clone())
 
-    if iterate_callback is not None:
-        prediction = physics.A(recon).clamp(min=filter_epsilon) + b
-        iterate_callback(max_steps, recon, prediction)
-
-    return (recon, xs) if keep_inter else recon
+    prediction = physics.A(recon).clamp(min=filter_epsilon) + b
+    record_metrics(metrics, recon, previous, prediction, y, x_ref, l2_weight=reg_weight)
+    if keep_inter:
+        metrics["iterates"] = xs
+    return recon, metrics

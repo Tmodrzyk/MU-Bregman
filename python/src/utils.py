@@ -1,7 +1,7 @@
-import numpy as np
 import torch
 import deepinv
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -9,6 +9,38 @@ from typing import Any
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 import deepinv as dinv
+
+
+METHODS = (
+    "MU",
+    "R-BPG + L2",
+    "R-BPG + TV",
+    "Mirror descent",
+    "BPG + L2",
+    "OSL + L2",
+    "OSL + TV",
+)
+MARKERS = ("o", "s", "^", "D", "v", "P", "X")
+COLOR_INDICES = (0, 1, 2, 3, 4, 7, 6)
+
+
+def method_plot_styles():
+    """Return fixed colorblind-palette colors and markers by method name."""
+    palette = sns.color_palette("colorblind", 10)
+    return {
+        name: dict(
+            label=name,
+            color=color,
+            linestyle="-",
+            marker=marker,
+            markevery=10,
+            markersize=9,
+            linewidth=2.5,
+        )
+        for name, color, marker in zip(
+            METHODS, (palette[index] for index in COLOR_INDICES), MARKERS, strict=True
+        )
+    }
 
 
 def plot_residual(
@@ -299,14 +331,29 @@ def plot_data_fidelity(
         return fig, ax
 
 
+def normalized_poisson_nll(x, y, physics):
+    """Poisson fidelity for gain-scaled observations, summed per batch item.
+
+    This is the count-data negative log-likelihood multiplied by the gain,
+    up to constants independent of x. Regularization weights use this scale.
+    """
+    prediction = physics.A(x)
+    if hasattr(physics, "background"):
+        prediction = prediction + physics.background
+    prediction = prediction.clamp_min(1e-20)
+    return (prediction - torch.special.xlogy(y, prediction)).flatten(1).sum(1)
+
+
 class KL_L2(dinv.optim.DataFidelity):
+    """Normalized Poisson fidelity plus Tikhonov regularization.
+
+    ``gain`` is retained for compatibility; y is already gain-scaled.
+    """
+
     def __init__(self, gain: float, reg_weight: float):
         super().__init__()
         self.gain = gain
         self.reg_weight = reg_weight
-        self.kl = dinv.optim.data_fidelity.PoissonLikelihood(
-            gain=gain, bkg=1e-20, denormalize=False
-        )
 
     def fn(
         self,
@@ -324,20 +371,19 @@ class KL_L2(dinv.optim.DataFidelity):
         :param deepinv.physics.Physics physics: physics model.
         :return: (:class:`torch.Tensor`) data fidelity :math:`\datafid{x}{y}`.
         """
-        x = x.to(physics.device)
-        return (
-            self.kl(x, y, physics) + (self.reg_weight / 2) * torch.linalg.norm(x) ** 2
-        )
+        return normalized_poisson_nll(x, y, physics) + (
+            self.reg_weight / 2
+        ) * x.square().flatten(1).sum(1)
 
 
 class KL_TV(dinv.optim.DataFidelity):
+    """Normalized Poisson fidelity plus DeepInverse's isotropic TV."""
+
     def __init__(self, gain: float, reg_weight: float):
         super().__init__()
         self.gain = gain
         self.reg_weight = reg_weight
-        self.kl = dinv.optim.data_fidelity.PoissonLikelihood(
-            gain=gain, bkg=1e-20, denormalize=False
-        )
+        self.tv_prior = dinv.optim.TVPrior()
 
     def fn(
         self,
@@ -355,7 +401,4 @@ class KL_TV(dinv.optim.DataFidelity):
         :param deepinv.physics.Physics physics: physics model.
         :return: (:class:`torch.Tensor`) data fidelity :math:`\datafid{x}{y}`.
         """
-        x = x.to(physics.device)
-        return self.kl(x, y, physics) + self.reg_weight * dinv.optim.prior.TVPrior().fn(
-            x
-        )
+        return normalized_poisson_nll(x, y, physics) + self.reg_weight * self.tv_prior.fn(x)

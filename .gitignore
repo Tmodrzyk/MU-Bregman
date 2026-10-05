@@ -218,3 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 latex/figures/*.pdf
 poisson_nll_surfaces.pdf
+output/

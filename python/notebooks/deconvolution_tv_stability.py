@@ -1,5 +1,5 @@
 # %%
-# ruff: noqa: E402
+import json
 import sys
 from pathlib import Path
 
@@ -19,13 +19,11 @@ import torch
 from deepinv.physics.functional import gaussian_blur
 from tqdm.auto import tqdm
 
-from src.algos import mlem_tv
-from src.prox import torch_divergence, torch_gradient, torch_module
-from src.utils import KL_TV
+from src.algos import rbpg_tv
 
 sns.set_theme(style="whitegrid", context="paper", palette="colorblind")
 torch.manual_seed(0)
-device = "cuda"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # %%
@@ -44,52 +42,36 @@ x = dinv.utils.load_example(
     device=device,
 )
 physics = dinv.physics.Blur(
-    filter=gaussian_blur(sigma=(1.6, 1.6), device=device),
+    filter=gaussian_blur(sigma=(2.0, 2.0), device=device),
     padding="circular",
     noise_model=dinv.physics.PoissonNoise(gain=gain),
 ).to(device)
 y = physics(x)
 x_init = torch.ones_like(y)
 s = physics.A_adjoint(torch.ones_like(y))
-
-fig, axes = plt.subplots(1, 2, figsize=(6, 3))
-for ax, image, title in zip(axes, [x, y], ["Image", "Observation"], strict=True):
-    ax.imshow(image.squeeze().cpu(), cmap="gray", vmin=0, vmax=1)
-    ax.set_title(title)
-    ax.axis("off")
-fig.tight_layout()
+tv_prior = dinv.optim.TVPrior()
 
 
-# %%
 @torch.no_grad()
-def run_osl(reg_weight, keep_inter=False):
-    """Run TV-OSL without clamping its regularization denominator."""
+def run_osl(reg_weight):
+    """Return a reconstruction or the reason and iteration of an invalid update."""
     recon = x_init.clone()
-    iterates = [recon.cpu().clone()] if keep_inter else None
-
-    for _ in range(max_iter):
-        gradient = torch_gradient(recon)
-        curvature = torch_divergence(
-            gradient / torch_module(gradient).clamp_min(eps).unsqueeze(0)
-        )
-        denominator = s - reg_weight * curvature
-
+    for iteration in range(max_iter):
+        denominator = s + reg_weight * tv_prior.grad(recon)
+        if not torch.isfinite(denominator).all():
+            return None, "nonfinite denominator", iteration + 1
         if (denominator <= 0).any():
-            return (None, iterates) if keep_inter else None
-
+            return None, "nonpositive denominator", iteration + 1
         prediction = physics.A(recon).clamp_min(eps)
-        recon = recon * physics.A_adjoint(y / prediction) / denominator
-
-        if keep_inter:
-            iterates.append(recon.cpu().clone())
-
-    reconstruction = recon if torch.isfinite(recon).all() else None
-    return (reconstruction, iterates) if keep_inter else reconstruction
+        recon = (recon * physics.A_adjoint(y / prediction) / denominator).clamp_min(eps)
+        if not torch.isfinite(recon).all():
+            return None, "nonfinite reconstruction", iteration + 1
+    return recon, None, None
 
 
 @torch.no_grad()
 def run_proposed(reg_weight):
-    recon = mlem_tv(
+    recon, _ = rbpg_tv(
         y=y,
         x_init=x_init,
         stepsize=1,
@@ -97,7 +79,6 @@ def run_proposed(reg_weight):
         reg_weight=reg_weight,
         max_steps=max_iter,
         niter_tv=niter_tv,
-        tv_prox="pdhg",
         verbose=False,
         filter_epsilon=eps,
     )
@@ -105,105 +86,11 @@ def run_proposed(reg_weight):
 
 
 # %%
-# Check convergence once for both methods before running the weight sweep.
-convergence_reg_weight = 0.25
-mu_reconstruction, mu_iterates = mlem_tv(
-    y=y,
-    x_init=x_init,
-    stepsize=1,
-    physics=physics,
-    reg_weight=convergence_reg_weight,
-    max_steps=max_iter,
-    niter_tv=niter_tv,
-    tv_prox="pdhg",
-    verbose=True,
-    keep_inter=True,
-    filter_epsilon=eps,
-)
-osl_reconstruction, osl_iterates = run_osl(
-    convergence_reg_weight,
-    keep_inter=True,
-)
-if osl_reconstruction is None:
-    raise RuntimeError("OSL-TV became unstable during the convergence check.")
-
-convergence_method_names = ["R-BPG + TV", "OSL + TV"]
-convergence_reconstructions = [mu_reconstruction, osl_reconstruction]
-convergence_iterates = [mu_iterates, osl_iterates]
-convergence_objective = KL_TV(
-    gain=gain,
-    reg_weight=convergence_reg_weight,
-)
-convergence_psnr = dinv.metric.PSNR()
-with torch.no_grad():
-    convergence_objective_values = [
-        [
-            convergence_objective(iterate.to(device), y, physics).item()
-            for iterate in method_iterates
-        ]
-        for method_iterates in convergence_iterates
-    ]
-    convergence_psnr_values = [
-        [convergence_psnr(iterate.to(device), x).item() for iterate in method_iterates]
-        for method_iterates in convergence_iterates
-    ]
-
-convergence_reconstruction_figure, axes = plt.subplots(1, 2, figsize=(6, 3))
-for ax, name, reconstruction, values in zip(
-    axes,
-    convergence_method_names,
-    convergence_reconstructions,
-    convergence_psnr_values,
-    strict=True,
-):
-    ax.imshow(reconstruction.squeeze().cpu(), cmap="gray", vmin=0, vmax=1)
-    ax.set_title(
-        f"{name}\n"
-        rf"$\lambda={convergence_reg_weight:g}$, "
-        f"PSNR={values[-1]:.2f} dB"
-    )
-    ax.axis("off")
-convergence_reconstruction_figure.tight_layout()
-
-convergence_metrics_figure, (objective_ax, psnr_history_ax) = plt.subplots(
-    1, 2, figsize=(12, 4)
-)
-for name, color, objective_values, psnr_history in zip(
-    convergence_method_names,
-    sns.color_palette("colorblind")[:2],
-    convergence_objective_values,
-    convergence_psnr_values,
-    strict=True,
-):
-    objective_ax.plot(
-        range(10, len(objective_values)),
-        objective_values[10:],
-        color=color,
-        label=name,
-    )
-    psnr_history_ax.plot(psnr_history, color=color, label=name)
-
-objective_ax.set(
-    xlabel="Iteration",
-    ylabel=r"Poisson NLL $+\,\lambda\,\mathrm{TV}(x)$",
-    title=rf"TV objective ($\lambda={convergence_reg_weight:g}$)",
-)
-objective_ax.set_yscale("log")
-objective_ax.legend()
-psnr_history_ax.set(
-    xlabel="Iteration",
-    ylabel="PSNR (dB)",
-    title="Reconstruction quality",
-)
-psnr_history_ax.legend()
-convergence_metrics_figure.tight_layout()
-
-
-# %%
-reconstructions = [
-    [run_proposed(weight) for weight in tqdm(reg_weights, desc="R-BPG + TV sweep")],
-    [run_osl(weight) for weight in tqdm(reg_weights, desc="OSL + TV sweep")],
+proposed_reconstructions = [
+    run_proposed(weight) for weight in tqdm(reg_weights, desc="R-BPG + TV sweep")
 ]
+osl_runs = [run_osl(weight) for weight in tqdm(reg_weights, desc="OSL + TV sweep")]
+reconstructions = [proposed_reconstructions, [run[0] for run in osl_runs]]
 psnr = dinv.metric.PSNR()
 psnr_values = np.array(
     [
@@ -214,22 +101,44 @@ psnr_values = np.array(
         for method_reconstructions in reconstructions
     ]
 )
-
 method_names = ["R-BPG + TV", "OSL + TV"]
-
-# %%
-reconstruction_reg_weights = [0.18, 0.07]
+if any(not np.isfinite(values).any() for values in psnr_values):
+    raise RuntimeError("A method has no successful reconstruction in the sweep.")
+best_indices = [int(np.nanargmax(values)) for values in psnr_values]
+reconstruction_reg_weights = [float(reg_weights[index]) for index in best_indices]
 selected_reconstructions = [
-    run_proposed(reconstruction_reg_weights[0]),
-    run_osl(reconstruction_reg_weights[1]),
+    method_reconstructions[index]
+    for method_reconstructions, index in zip(reconstructions, best_indices, strict=True)
 ]
-if any(reconstruction is None for reconstruction in selected_reconstructions):
-    raise RuntimeError(
-        "A reconstruction failed at its predefined regularization weight."
-    )
 selected_psnr_values = [
-    psnr(reconstruction, x).item() for reconstruction in selected_reconstructions
+    float(values[index])
+    for values, index in zip(psnr_values, best_indices, strict=True)
 ]
+print(
+    json.dumps(
+        {
+            "blur_sigma": 2.0,
+            "gain": gain,
+            "best_weights": dict(
+                zip(method_names, reconstruction_reg_weights, strict=True)
+            ),
+            "best_psnr": dict(zip(method_names, selected_psnr_values, strict=True)),
+            "proposed_failed_weights": [
+                float(weight)
+                for weight, reconstruction in zip(
+                    reg_weights, proposed_reconstructions, strict=True
+                )
+                if reconstruction is None
+            ],
+            "osl_failures": [
+                {"weight": float(weight), "reason": run[1], "iteration": run[2]}
+                for weight, run in zip(reg_weights, osl_runs, strict=True)
+                if run[0] is None
+            ],
+        },
+        indent=2,
+    )
+)
 
 sweep_reconstruction_figure, axes = plt.subplots(1, 2, figsize=(6, 3))
 for ax, name, reconstruction, reg_weight, psnr_value in zip(
@@ -247,7 +156,7 @@ for ax, name, reconstruction, reg_weight, psnr_value in zip(
         vmax=1,
     )
     ax.set_title(
-        f"{name}\n" rf"$\lambda={reg_weight:.2f}$, " f"PSNR={psnr_value:.2f} dB"
+        f"{name}\n" rf"$\lambda={reg_weight:.3g}$, " f"PSNR={psnr_value:.2f} dB"
     )
     ax.axis("off")
 sweep_reconstruction_figure.tight_layout()
@@ -275,6 +184,18 @@ for name, color, values in zip(
         markersize=4,
         color=color,
         label=name,
+    )
+failed_weights = [
+    weight for weight, run in zip(reg_weights, osl_runs, strict=True) if run[0] is None
+]
+if failed_weights:
+    psnr_ax.plot(
+        failed_weights,
+        [0.04] * len(failed_weights),
+        "x",
+        transform=psnr_ax.get_xaxis_transform(),
+        color=sns.color_palette("colorblind")[1],
+        label="OSL: invalid update",
     )
 psnr_ax.set_xlabel(r"Regularization weight $\lambda$")
 psnr_ax.set_ylabel("PSNR (dB)")
